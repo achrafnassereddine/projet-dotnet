@@ -7,21 +7,30 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
-  trivy-scan-and-ingest:
-    name: Trivy Vulnerability Scan & Ingestion
+  multi-scanner-pipeline:
+    name: Trivy + Gitleaks + CodeQL Scan & Ingestion
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (full history for Gitleaks)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      - name: Restore NuGet dependencies (generates packages.lock.json for Trivy)
+      # ---------------------------------------------------------
+      # 1. TRIVY (SCA - NuGet Dependencies)
+      # ---------------------------------------------------------
+      - name: Restore NuGet dependencies (generates packages.lock.json)
         run: dotnet restore DevSecOpsSaaS/DevSecOpsSaaS.csproj --use-lock-file
 
       - name: Install Trivy CLI
@@ -32,7 +41,40 @@ jobs:
         run: |
           trivy fs --scanners vuln --format json --output trivy-report.json --exit-code 0 .
 
-      - name: Normalize Trivy JSON & Push to DevSecOpsSaaS API
+      # ---------------------------------------------------------
+      # 2. GITLEAKS (Secrets Detection)
+      # ---------------------------------------------------------
+      - name: Install & Run Gitleaks
+        run: |
+          GITLEAKS_VER="8.21.2"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          rm -f gitleaks.tar.gz
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json --exit-code 0
+
+      # ---------------------------------------------------------
+      # 3. CODEQL (SAST - C# Static Analysis)
+      # ---------------------------------------------------------
+      - name: Initialize CodeQL (C#)
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+          queries: security-extended
+
+      - name: Build .NET project for CodeQL
+        run: dotnet build DevSecOpsSaaS/DevSecOpsSaaS.csproj --no-restore
+
+      - name: Perform CodeQL Analysis (SARIF export)
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-results
+          upload: false
+
+      # ---------------------------------------------------------
+      # 4. NORMALIZE ALL 3 REPORTS & INGEST INTO DEVSECOPSSAAS
+      # ---------------------------------------------------------
+      - name: Normalize Trivy, Gitleaks & CodeQL & Push to DevSecOpsSaaS API
         env:
           DEVSECOPS_API_URL: ${{ secrets.DEVSECOPS_API_URL }}
           DEVSECOPS_API_KEY: ${{ secrets.DEVSECOPS_API_KEY }}
@@ -41,11 +83,45 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
           python3 - << 'EOF'
+          import glob
           import json
           import os
           import urllib.request
           import urllib.error
 
+          api_url = os.environ["DEVSECOPS_API_URL"].rstrip("/") + "/api/rapports"
+          api_key = os.environ["DEVSECOPS_API_KEY"]
+          commit_sha = os.environ["COMMIT_SHA"][:8]
+          branch_name = os.environ["BRANCH_NAME"][:150]
+          build_num = f"gh-{os.environ['BUILD_NUMBER']}"[:100]
+
+          def post_rapport(outil_name, vulns):
+              payload = {
+                  "outil": outil_name[:100],
+                  "commitSha": commit_sha,
+                  "branche": branch_name,
+                  "numeroBuild": build_num,
+                  "vulnerabilites": vulns
+              }
+              req = urllib.request.Request(
+                  api_url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                      "User-Agent": "DevSecOpsSaaS-GitHubActions/1.0"
+                  },
+                  method="POST"
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      print(f"[{outil_name}] Ingestion succeeded ({resp.status}): {len(vulns)} findings sent.")
+                      print(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  print(f"[{outil_name}] Ingestion failed ({e.code}): {e.read().decode('utf-8')}")
+                  raise
+
+          # --- 1. Parse Trivy JSON ---
           severity_map = {
               "CRITICAL": "Critique",
               "HIGH": "Haute",
@@ -53,67 +129,125 @@ jobs:
               "LOW": "Faible",
               "UNKNOWN": "Faible"
           }
+          trivy_vulns = []
+          if os.path.exists("trivy-report.json"):
+              with open("trivy-report.json", "r", encoding="utf-8") as f:
+                  trivy_data = json.load(f)
+              for result in trivy_data.get("Results", []):
+                  target = (result.get("Target") or "")[:500]
+                  for v in result.get("Vulnerabilities") or []:
+                      cvss_score = 5.0
+                      for source_data in (v.get("CVSS") or {}).values():
+                          if isinstance(source_data, dict) and source_data.get("V3Score") is not None:
+                              cvss_score = max(0.0, min(10.0, float(source_data["V3Score"])))
+                              break
+                      cve_id = (v.get("VulnerabilityID") or "UNKNOWN")[:100]
+                      pkg_name = v.get("PkgName") or "unknown"
+                      installed_ver = v.get("InstalledVersion") or "unknown"
+                      fixed_ver = v.get("FixedVersion")
+                      sev = (v.get("Severity") or "MEDIUM").upper()
+                      trivy_vulns.append({
+                          "cveId": cve_id,
+                          "titre": (v.get("Title") or f"{cve_id} in {pkg_name}")[:250],
+                          "description": v.get("Description") or f"Detected by Trivy in {target}",
+                          "fichier": target if target else None,
+                          "package": f"{pkg_name}@{installed_ver}"[:250],
+                          "recommandation": f"Mettre a jour {pkg_name} vers {fixed_ver}" if fixed_ver else None,
+                          "scoreBrut": cvss_score,
+                          "gravite": severity_map.get(sev, "Moyenne")
+                      })
+          post_rapport("Trivy", trivy_vulns)
 
-          with open("trivy-report.json", "r", encoding="utf-8") as f:
-              trivy_data = json.load(f)
-
-          vulnerabilities = []
-          for result in trivy_data.get("Results", []):
-              target = (result.get("Target") or "")[:500]
-              for v in result.get("Vulnerabilities") or []:
-                  cvss_score = 5.0
-                  cvss_block = v.get("CVSS") or {}
-                  for source_data in cvss_block.values():
-                      if isinstance(source_data, dict) and source_data.get("V3Score") is not None:
-                          cvss_score = max(0.0, min(10.0, float(source_data["V3Score"])))
-                          break
-
-                  cve_id = (v.get("VulnerabilityID") or "UNKNOWN")[:100]
-                  pkg_name = v.get("PkgName") or "unknown"
-                  installed_ver = v.get("InstalledVersion") or "unknown"
-                  package_str = f"{pkg_name}@{installed_ver}"[:250]
-                  raw_title = v.get("Title") or f"{cve_id} in {pkg_name}"
-                  raw_desc = v.get("Description") or f"Detected by Trivy in {target}"
-                  fixed_ver = v.get("FixedVersion")
-                  recommandation = f"Mettre a jour {pkg_name} vers {fixed_ver}" if fixed_ver else None
-
-                  sev = (v.get("Severity") or "MEDIUM").upper()
-                  vulnerabilities.append({
-                      "cveId": cve_id,
-                      "titre": raw_title[:250],
-                      "description": raw_desc,
-                      "fichier": target if target else None,
-                      "package": package_str,
-                      "recommandation": recommandation,
-                      "scoreBrut": cvss_score,
-                      "gravite": severity_map.get(sev, "Moyenne")
+          # --- 2. Parse Gitleaks JSON ---
+          gitleaks_vulns = []
+          if os.path.exists("gitleaks-report.json"):
+              with open("gitleaks-report.json", "r", encoding="utf-8") as f:
+                  leaks = json.load(f) or []
+              for leak in leaks:
+                  rule_id = leak.get("RuleID") or "generic-secret"
+                  file_path = (leak.get("File") or "unknown")[:500]
+                  start_line = leak.get("StartLine")
+                  line_val = int(start_line) if isinstance(start_line, int) and start_line >= 1 else None
+                  commit_leak = leak.get("Commit") or "working-tree"
+                  gitleaks_vulns.append({
+                      "cveId": f"SECRET-{rule_id}"[:100],
+                      "titre": f"Secret expose ({leak.get('Description') or rule_id}) dans {file_path}"[:250],
+                      "description": f"Secret detecte par Gitleaks (regle: {rule_id}, commit: {commit_leak[:12]}). Valeur masquee par securite.",
+                      "fichier": file_path,
+                      "ligne": line_val,
+                      "package": "Git-Secrets"[:250],
+                      "recommandation": "Revoquer immediatement le secret expose, purger l'historique Git et utiliser un gestionnaire de secrets.",
+                      "scoreBrut": 9.1,
+                      "gravite": "Critique"
                   })
+          post_rapport("Gitleaks", gitleaks_vulns)
 
-          payload = {
-              "outil": "Trivy",
-              "commitSha": os.environ["COMMIT_SHA"][:8],
-              "branche": os.environ["BRANCH_NAME"][:150],
-              "numeroBuild": f"gh-{os.environ['BUILD_NUMBER']}"[:100],
-              "vulnerabilites": vulnerabilities
-          }
+          # --- 3. Parse CodeQL SARIF ---
+          codeql_vulns = []
+          for sarif_path in glob.glob("codeql-results/*.sarif"):
+              with open(sarif_path, "r", encoding="utf-8") as f:
+                  sarif = json.load(f)
+              for run in sarif.get("runs", []):
+                  rules_by_id = {}
+                  driver = run.get("tool", {}).get("driver", {})
+                  for rule in driver.get("rules", []):
+                      rules_by_id[rule.get("id")] = rule
+                  for ext in run.get("tool", {}).get("extensions", []):
+                      for rule in ext.get("rules", []):
+                          rules_by_id[rule.get("id")] = rule
 
-          api_url = os.environ["DEVSECOPS_API_URL"].rstrip("/") + "/api/rapports"
-          req = urllib.request.Request(
-              api_url,
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {os.environ['DEVSECOPS_API_KEY']}",
-                  "Content-Type": "application/json",
-                  "User-Agent": "DevSecOpsSaaS-GitHubActions/1.0"
-              },
-              method="POST"
-          )
+                  for res in run.get("results", []):
+                      rule_id = res.get("ruleId") or "codeql-finding"
+                      rule_meta = rules_by_id.get(rule_id, {})
+                      props = rule_meta.get("properties", {})
 
-          try:
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  print(f"Ingestion succeeded ({resp.status}): {len(vulnerabilities)} findings sent.")
-                  print(resp.read().decode("utf-8"))
-          except urllib.error.HTTPError as e:
-              print(f"Ingestion failed ({e.code}): {e.read().decode('utf-8')}")
-              raise
+                      # Extract CVSS / security-severity score (0.0 - 10.0) from SARIF metadata
+                      raw_sev_score = props.get("security-severity")
+                      try:
+                          score = max(0.0, min(10.0, float(raw_sev_score))) if raw_sev_score is not None else 6.5
+                      except ValueError:
+                          score = 6.5
+
+                      if score >= 9.0:
+                          gravite = "Critique"
+                      elif score >= 7.0:
+                          gravite = "Haute"
+                      elif score >= 4.0:
+                          gravite = "Moyenne"
+                      else:
+                          gravite = "Faible"
+
+                      # Extract CWE tag if present
+                      cwe_tags = [t.split("/")[-1].upper() for t in props.get("tags", []) if "cwe-" in t.lower()]
+                      identifier = f"{cwe_tags[0]} ({rule_id})" if cwe_tags else rule_id
+
+                      # Extract file path and line number
+                      file_path = None
+                      line_num = None
+                      locations = res.get("locations") or []
+                      if locations:
+                          phys = locations[0].get("physicalLocation", {})
+                          uri = phys.get("artifactLocation", {}).get("uri")
+                          if uri:
+                              file_path = uri[:500]
+                          start_line = phys.get("region", {}).get("startLine")
+                          if isinstance(start_line, int) and start_line >= 1:
+                              line_num = start_line
+
+                      short_desc = (rule_meta.get("shortDescription", {}).get("text") or rule_id)
+                      msg_text = res.get("message", {}).get("text") or short_desc
+                      help_text = rule_meta.get("help", {}).get("text")
+
+                      codeql_vulns.append({
+                          "cveId": identifier[:100],
+                          "titre": f"{short_desc}"[:250],
+                          "description": msg_text,
+                          "fichier": file_path,
+                          "ligne": line_num,
+                          "package": "CodeQL-CSharp"[:250],
+                          "recommandation": help_text[:1000] if help_text else "Corriger le flux de donnees non valide selon les recommandations CodeQL.",
+                          "scoreBrut": score,
+                          "gravite": gravite
+                      })
+          post_rapport("CodeQL", codeql_vulns)
           EOF
