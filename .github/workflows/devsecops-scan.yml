@@ -1,0 +1,111 @@
+name: DevSecOps Security Scan
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  trivy-scan-and-ingest:
+    name: Trivy Vulnerability Scan & Ingestion
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore NuGet dependencies (generates project.assets.json for Trivy)
+        run: dotnet restore DevSecOpsSaaS/DevSecOpsSaaS.csproj
+
+      - name: Run Trivy filesystem vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln'
+          format: 'json'
+          output: 'trivy-report.json'
+          exit-code: '0'
+
+      - name: Normalize Trivy JSON & Push to DevSecOpsSaaS API
+        env:
+          DEVSECOPS_API_URL: ${{ secrets.DEVSECOPS_API_URL }}
+          DEVSECOPS_API_KEY: ${{ secrets.DEVSECOPS_API_KEY }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 - << 'EOF'
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+
+          severity_map = {
+              "CRITICAL": "Critique",
+              "HIGH": "Haute",
+              "MEDIUM": "Moyenne",
+              "LOW": "Faible",
+              "UNKNOWN": "Faible"
+          }
+
+          with open("trivy-report.json", "r", encoding="utf-8") as f:
+              trivy_data = json.load(f)
+
+          vulnerabilities = []
+          for result in trivy_data.get("Results", []):
+              target = result.get("Target", "")
+              for v in result.get("Vulnerabilities") or []:
+                  cvss_score = 5.0
+                  cvss_block = v.get("CVSS") or {}
+                  for source_data in cvss_block.values():
+                      if isinstance(source_data, dict) and source_data.get("V3Score") is not None:
+                          cvss_score = float(source_data["V3Score"])
+                          break
+
+                  sev = v.get("Severity", "MEDIUM").upper()
+                  vulnerabilities.append({
+                      "cveId": v.get("VulnerabilityID"),
+                      "titre": v.get("Title") or f"{v.get('VulnerabilityID')} in {v.get('PkgName')}",
+                      "description": v.get("Description") or f"Detected by Trivy in {target}",
+                      "package": f"{v.get('PkgName')}@{v.get('InstalledVersion')}",
+                      "fichier": target,
+                      "scoreBrut": cvss_score,
+                      "gravite": severity_map.get(sev, "Moyenne")
+                  })
+
+          payload = {
+              "outil": "Trivy",
+              "commitSha": os.environ["COMMIT_SHA"][:8],
+              "branche": os.environ["BRANCH_NAME"],
+              "numeroBuild": f"gh-{os.environ['BUILD_NUMBER']}",
+              "vulnerabilites": vulnerabilities
+          }
+
+          api_url = os.environ["DEVSECOPS_API_URL"].rstrip("/") + "/api/rapports"
+          req = urllib.request.Request(
+              api_url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {os.environ['DEVSECOPS_API_KEY']}",
+                  "Content-Type": "application/json",
+                  "User-Agent": "DevSecOpsSaaS-GitHubActions/1.0"
+              },
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Ingestion succeeded ({resp.status}): {len(vulnerabilities)} findings sent.")
+                  print(resp.read().decode("utf-8"))
+          except urllib.error.HTTPError as e:
+              print(f"Ingestion failed ({e.code}): {e.read().decode('utf-8')}")
+              raise
+          EOF
