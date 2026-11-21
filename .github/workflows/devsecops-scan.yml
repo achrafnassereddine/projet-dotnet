@@ -59,22 +59,32 @@ jobs:
 
           vulnerabilities = []
           for result in trivy_data.get("Results", []):
-              target = result.get("Target", "")
+              target = (result.get("Target") or "")[:500]
               for v in result.get("Vulnerabilities") or []:
                   cvss_score = 5.0
                   cvss_block = v.get("CVSS") or {}
                   for source_data in cvss_block.values():
                       if isinstance(source_data, dict) and source_data.get("V3Score") is not None:
-                          cvss_score = float(source_data["V3Score"])
+                          cvss_score = max(0.0, min(10.0, float(source_data["V3Score"])))
                           break
 
-                  sev = v.get("Severity", "MEDIUM").upper()
+                  cve_id = (v.get("VulnerabilityID") or "UNKNOWN")[:100]
+                  pkg_name = v.get("PkgName") or "unknown"
+                  installed_ver = v.get("InstalledVersion") or "unknown"
+                  package_str = f"{pkg_name}@{installed_ver}"[:250]
+                  raw_title = v.get("Title") or f"{cve_id} in {pkg_name}"
+                  raw_desc = v.get("Description") or f"Detected by Trivy in {target}"
+                  fixed_ver = v.get("FixedVersion")
+                  recommandation = f"Mettre a jour {pkg_name} vers {fixed_ver}" if fixed_ver else None
+
+                  sev = (v.get("Severity") or "MEDIUM").upper()
                   vulnerabilities.append({
-                      "cveId": v.get("VulnerabilityID"),
-                      "titre": v.get("Title") or f"{v.get('VulnerabilityID')} in {v.get('PkgName')}",
-                      "description": v.get("Description") or f"Detected by Trivy in {target}",
-                      "package": f"{v.get('PkgName')}@{v.get('InstalledVersion')}",
-                      "fichier": target,
+                      "cveId": cve_id,
+                      "titre": raw_title[:250],
+                      "description": raw_desc,
+                      "fichier": target if target else None,
+                      "package": package_str,
+                      "recommandation": recommandation,
                       "scoreBrut": cvss_score,
                       "gravite": severity_map.get(sev, "Moyenne")
                   })
@@ -82,8 +92,8 @@ jobs:
           payload = {
               "outil": "Trivy",
               "commitSha": os.environ["COMMIT_SHA"][:8],
-              "branche": os.environ["BRANCH_NAME"],
-              "numeroBuild": f"gh-{os.environ['BUILD_NUMBER']}",
+              "branche": os.environ["BRANCH_NAME"][:150],
+              "numeroBuild": f"gh-{os.environ['BUILD_NUMBER']}"[:100],
               "vulnerabilites": vulnerabilities
           }
 
