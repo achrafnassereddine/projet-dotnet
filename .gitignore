@@ -1,0 +1,26 @@
+# Build & artefacts .NET
+**/bin/
+**/obj/
+**/out/
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+.vs/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Secrets & environnements locaux (ne jamais commit)
+appsettings.*.json
+!appsettings.json
+*.secret*
+*.pfx
+*.key
+
+# Fichiers temporaires / logs
+*.log
+*.tmp
+TestResults/
+coverage*.xml
