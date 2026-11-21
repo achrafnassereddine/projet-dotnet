@@ -248,4 +248,4 @@ public class RapportService
                 obj.CveId.ToLowerInvariant(),
                 obj.Package.ToLowerInvariant());
     }
-}
+}  
